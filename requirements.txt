@@ -1,7 +1,12 @@
-# BabaYaga License Bot v2.0
-python-telegram-bot==20.6
-httpx==0.25.0
-httpcore==0.18.0
-flask==3.0.0
-werkzeug==3.0.1
+# BabaYaga License Bot — Render-compatible pins
+python-telegram-bot==21.6
+httpx==0.27.2
+httpcore==1.0.5
+anyio==4.6.2.post1
+h11==0.14.0
+sniffio==1.3.1
+certifi>=2024.2.2
+idna>=3.6
+flask==3.0.3
+werkzeug==3.0.3
 psycopg2-binary==2.9.9
