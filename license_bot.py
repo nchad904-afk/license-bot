@@ -190,16 +190,25 @@ def get_db():
     USE_POSTGRES = _use_postgres()
     if USE_POSTGRES:
         url = _normalize_database_url(DATABASE_URL)
-        connect_kwargs = {"connect_timeout": 10}
+        connect_kwargs = {"connect_timeout": 15}
         # Neon/Render require SSL; skip if already in the URL
         if "sslmode=" not in url.lower():
             connect_kwargs["sslmode"] = "require"
-        try:
-            conn = psycopg2.connect(url, **connect_kwargs)
-            return PostgresConnectionWrapper(conn)
-        except Exception as e:
-            logger.error(f"Database connection failed: {_friendly_db_error(e)}")
-            raise
+        last_err = None
+        # Neon free compute can be cold — retry a few times
+        for attempt in range(1, 4):
+            try:
+                conn = psycopg2.connect(url, **connect_kwargs)
+                return PostgresConnectionWrapper(conn)
+            except Exception as e:
+                last_err = e
+                logger.error(
+                    f"Database connection failed (try {attempt}/3): {_friendly_db_error(e)}"
+                )
+                if attempt < 3:
+                    import time
+                    time.sleep(2 * attempt)
+        raise last_err
     else:
         conn = sqlite3.connect(DB_FILE)
         conn.row_factory = sqlite3.Row
@@ -210,10 +219,18 @@ def check_db_health() -> Dict:
     """Lightweight DB health probe for /api/health and status page."""
     url_present = bool(_get_database_url())
     backend = "postgres" if _use_postgres() else "sqlite"
+    db_host = None
+    if url_present:
+        try:
+            from urllib.parse import urlparse
+            db_host = urlparse(_normalize_database_url(_get_database_url())).hostname
+        except Exception:
+            db_host = "parse_error"
     info = {
         "database_url_present": url_present,
         "psycopg2_loaded": HAS_POSTGRES,
         "psycopg2_error": PSYCOPG2_IMPORT_ERROR,
+        "db_host": db_host,
     }
     if url_present and not HAS_POSTGRES:
         return {
@@ -2489,6 +2506,12 @@ def main():
     print("=" * 60)
     print("🔐 BabaYaga License Bot v2.0 Starting...")
     print("=" * 60)
+
+    # MUST be first on Render/Python 3.10 — PTB needs a loop on MainThread
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
     
     try:
         # Start Flask HTTP server in background thread
@@ -2536,6 +2559,8 @@ def main():
         
         # Post init callback to set menu commands
         async def post_init(application):
+            me = await application.bot.get_me()
+            print(f"✅ Telegram identity: @{me.username} (id={me.id})")
             await application.bot.set_my_commands([
                 ("start", "🏠 Main Menu / মূল মেনু"),
                 ("help", "💬 Help & Support / সাহায্য"),
@@ -2594,8 +2619,17 @@ def main():
         print("🚀 Bot is now running!")
         print("=" * 60)
         
-        # Start polling
-        app.run_polling(drop_pending_updates=True)
+        # Ensure loop again right before polling (Render MainThread quirk)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError("loop closed")
+        except Exception:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        
+        # stop_signals=None = required on some hosts so polling isn't killed
+        app.run_polling(drop_pending_updates=True, stop_signals=None)
         
     except Exception as e:
         logger.error(f"❌ Bot crashed: {e}")
