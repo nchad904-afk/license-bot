@@ -52,9 +52,23 @@ except:
 # Database Configuration - Neon/Postgres preferred, SQLite fallback
 # Set DATABASE_URL on Render to a Neon connection string, e.g.:
 # postgresql://USER:PASS@HOST.neon.tech/neondb?sslmode=require
-DATABASE_URL = os.environ.get("DATABASE_URL")
 DB_FILE = "licenses.db"
-USE_POSTGRES = bool(DATABASE_URL and HAS_POSTGRES)
+
+
+def _get_database_url() -> Optional[str]:
+    """Read DATABASE_URL at call-time (Render env changes require restart)."""
+    url = os.environ.get("DATABASE_URL") or os.environ.get("database_url") or ""
+    url = url.strip().strip('"').strip("'")
+    return url or None
+
+
+def _use_postgres() -> bool:
+    return bool(_get_database_url() and HAS_POSTGRES)
+
+
+# Back-compat aliases (updated in get_db / health)
+DATABASE_URL = _get_database_url()
+USE_POSTGRES = _use_postgres()
 
 
 def _normalize_database_url(url: str) -> str:
@@ -65,6 +79,13 @@ def _normalize_database_url(url: str) -> str:
     # Some hosts still issue postgres:// — psycopg2 expects postgresql://
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
+    # channel_binding=require breaks many psycopg2 builds — drop it
+    if "channel_binding=" in url.lower():
+        parts = url.split("?")
+        if len(parts) == 2:
+            base, qs = parts
+            params = [p for p in qs.split("&") if not p.lower().startswith("channel_binding=")]
+            url = base + (("?" + "&".join(params)) if params else "")
     return url
 
 
@@ -160,6 +181,9 @@ class PostgresConnectionWrapper:
 
 def get_db():
     """Get database connection - Neon/PostgreSQL or SQLite."""
+    global DATABASE_URL, USE_POSTGRES
+    DATABASE_URL = _get_database_url()
+    USE_POSTGRES = _use_postgres()
     if USE_POSTGRES:
         url = _normalize_database_url(DATABASE_URL)
         connect_kwargs = {"connect_timeout": 10}
@@ -180,7 +204,28 @@ def get_db():
 
 def check_db_health() -> Dict:
     """Lightweight DB health probe for /api/health and status page."""
-    backend = "postgres" if USE_POSTGRES else "sqlite"
+    url_present = bool(_get_database_url())
+    backend = "postgres" if _use_postgres() else "sqlite"
+    info = {
+        "database_url_present": url_present,
+        "psycopg2_loaded": HAS_POSTGRES,
+    }
+    if url_present and not HAS_POSTGRES:
+        return {
+            "ok": False,
+            "db": "down",
+            "backend": "sqlite",
+            "message": "DATABASE_URL is set but psycopg2 failed to import. Redeploy with psycopg2-binary in requirements.txt",
+            **info,
+        }
+    if not url_present:
+        return {
+            "ok": True,
+            "db": "up",
+            "backend": "sqlite",
+            "message": "DATABASE_URL not visible to process — using SQLite. Save env + Manual Deploy on Render.",
+            **info,
+        }
     try:
         conn = get_db()
         cursor = conn.cursor()
@@ -192,6 +237,7 @@ def check_db_health() -> Dict:
             "db": "up",
             "backend": backend,
             "message": "Database connected",
+            **info,
         }
     except Exception as e:
         return {
@@ -199,6 +245,7 @@ def check_db_health() -> Dict:
             "db": "down",
             "backend": backend,
             "message": _friendly_db_error(e),
+            **info,
         }
 
 def init_database():
@@ -2455,10 +2502,14 @@ def main():
         
         print(f"📱 Bot Token: {BOT_TOKEN[:15]}...")
         print(f"👤 Admin ID: {ADMIN_ID}")
-        print(f"🗄  DB backend: {'postgres/Neon' if USE_POSTGRES else 'sqlite'}")
-        if not USE_POSTGRES:
-            print("⚠️ DATABASE_URL missing — using SQLite (data lost on Render restart).")
-            print("   Set Render Environment DATABASE_URL to your Neon connection string.")
+        print(f"🗄  DB backend: {'postgres/Neon' if _use_postgres() else 'sqlite'}")
+        print(f"🗄  DATABASE_URL present: {bool(_get_database_url())} | psycopg2: {HAS_POSTGRES}")
+        if not _use_postgres():
+            print("⚠️ Not using Neon/Postgres — SQLite fallback (data lost on Render restart).")
+            if not _get_database_url():
+                print("   DATABASE_URL not visible. Save Environment + Manual Deploy.")
+            elif not HAS_POSTGRES:
+                print("   psycopg2 not loaded. Ensure psycopg2-binary is in requirements.txt")
         
         # Initialize database (clear error if DATABASE_URL is dead)
         try:
