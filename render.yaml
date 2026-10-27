@@ -1,0 +1,21 @@
+# Render.com Blueprint Configuration
+# Web service stays on Render; database should be Neon (free serverless Postgres).
+# Do NOT rely on Render free Postgres — dead hostnames break /api/verify and Telegram admin.
+
+services:
+  - type: web
+    name: babayaga-license-bot
+    runtime: python
+    region: oregon  # Free tier region
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python license_bot.py
+    envVars:
+      - key: TOKEN
+        sync: false  # Set manually in dashboard (Telegram bot token)
+      - key: ADMIN_ID
+        sync: false  # Set manually in dashboard (your Telegram user id)
+      - key: DATABASE_URL
+        sync: false  # Neon connection string: postgresql://USER:PASS@HOST.neon.tech/neondb?sslmode=require
+      - key: PYTHON_VERSION
+        value: "3.11.4"

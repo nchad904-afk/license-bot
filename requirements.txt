@@ -1,0 +1,7 @@
+# BabaYaga License Bot v2.0
+python-telegram-bot==20.6
+httpx==0.25.0
+httpcore==0.18.0
+flask==3.0.0
+werkzeug==3.0.1
+psycopg2-binary==2.9.9
