@@ -17,13 +17,17 @@ from datetime import datetime, timedelta
 from typing import Tuple, List, Optional, Dict
 from functools import wraps
 
-# PostgreSQL support
+# PostgreSQL support (Neon / Render)
+HAS_POSTGRES = False
+PSYCOPG2_IMPORT_ERROR = None
 try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
+    import psycopg2  # noqa: F401
+    from psycopg2.extras import RealDictCursor  # noqa: F401
     HAS_POSTGRES = True
-except ImportError:
+except Exception as e:
     HAS_POSTGRES = False
+    PSYCOPG2_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+    print(f"[WARN] psycopg2 import failed: {PSYCOPG2_IMPORT_ERROR}")
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -209,13 +213,18 @@ def check_db_health() -> Dict:
     info = {
         "database_url_present": url_present,
         "psycopg2_loaded": HAS_POSTGRES,
+        "psycopg2_error": PSYCOPG2_IMPORT_ERROR,
     }
     if url_present and not HAS_POSTGRES:
         return {
             "ok": False,
             "db": "down",
             "backend": "sqlite",
-            "message": "DATABASE_URL is set but psycopg2 failed to import. Redeploy with psycopg2-binary in requirements.txt",
+            "message": (
+                "DATABASE_URL is set but psycopg2 failed to import. "
+                f"Error: {PSYCOPG2_IMPORT_ERROR}. "
+                "Ensure requirements.txt has psycopg2-binary and Clear build cache & deploy."
+            ),
             **info,
         }
     if not url_present:
