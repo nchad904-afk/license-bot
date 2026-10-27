@@ -2456,6 +2456,9 @@ def main():
         print(f"📱 Bot Token: {BOT_TOKEN[:15]}...")
         print(f"👤 Admin ID: {ADMIN_ID}")
         print(f"🗄  DB backend: {'postgres/Neon' if USE_POSTGRES else 'sqlite'}")
+        if not USE_POSTGRES:
+            print("⚠️ DATABASE_URL missing — using SQLite (data lost on Render restart).")
+            print("   Set Render Environment DATABASE_URL to your Neon connection string.")
         
         # Initialize database (clear error if DATABASE_URL is dead)
         try:
@@ -2483,7 +2486,15 @@ def main():
             print("✅ Bot menu commands set successfully!")
         
         # Create bot application with post_init
-        app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+        # PTB 21.x on Render: build Application after HTTP thread is up
+        app = (
+            Application.builder()
+            .token(BOT_TOKEN)
+            .post_init(post_init)
+            .connect_timeout(30.0)
+            .read_timeout(30.0)
+            .build()
+        )
         
         # Register handlers
         app.add_handler(CommandHandler("start", start_command))
