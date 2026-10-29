@@ -134,6 +134,35 @@ customer_chats = {}  # {user_id: {"name": name, "username": username, "last_msg_
 # DATABASE FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class _HybridRow:
+    """Row that supports both row[0] (sqlite-style) and row['col'] (dict-style)."""
+    __slots__ = ("_vals", "_map")
+
+    def __init__(self, columns, values):
+        self._vals = tuple(values)
+        self._map = {str(c): v for c, v in zip(columns, values)}
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._vals[key]
+        return self._map[key]
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except (KeyError, IndexError):
+            return default
+
+    def __iter__(self):
+        return iter(self._vals)
+
+    def __len__(self):
+        return len(self._vals)
+
+    def keys(self):
+        return self._map.keys()
+
+
 class PostgresCursorWrapper:
     """Wrapper to make PostgreSQL cursor behave like SQLite cursor"""
     def __init__(self, cursor):
@@ -143,6 +172,10 @@ class PostgresCursorWrapper:
     def execute(self, query, params=None):
         # Convert SQLite ? placeholders to PostgreSQL %s
         query = query.replace('?', '%s')
+        # SQLite DATE("now") → Postgres CURRENT_DATE
+        if 'DATE("now")' in query or "DATE('now')" in query:
+            query = query.replace('DATE("now")', 'CURRENT_DATE').replace("DATE('now')", 'CURRENT_DATE')
+            query = query.replace('DATE(verify_time)', '(verify_time::date)')
         if params:
             self._cursor.execute(query, params)
         else:
@@ -152,14 +185,18 @@ class PostgresCursorWrapper:
     
     def fetchone(self):
         row = self._cursor.fetchone()
-        if row and self._columns:
-            return dict(zip(self._columns, row))
+        if row is None:
+            return None
+        if self._columns:
+            return _HybridRow(self._columns, row)
         return row
     
     def fetchall(self):
         rows = self._cursor.fetchall()
-        if rows and self._columns:
-            return [dict(zip(self._columns, row)) for row in rows]
+        if not rows:
+            return []
+        if self._columns:
+            return [_HybridRow(self._columns, r) for r in rows]
         return rows
     
     @property
@@ -291,7 +328,7 @@ def init_database():
                 created_date TEXT NOT NULL,
                 expiry_date TEXT NOT NULL,
                 is_active INTEGER DEFAULT 1,
-                max_devices INTEGER DEFAULT 2,
+                max_devices INTEGER DEFAULT 1,
                 current_devices INTEGER DEFAULT 0,
                 last_verified TEXT,
                 verify_count INTEGER DEFAULT 0,
@@ -299,6 +336,11 @@ def init_database():
                 created_by TEXT DEFAULT 'ADMIN'
             )
         ''')
+        # Harden existing rows: 1 device per key (customer cannot multi-PC same key)
+        try:
+            cursor.execute('UPDATE licenses SET max_devices = 1 WHERE max_devices IS NULL OR max_devices > 1')
+        except Exception:
+            pass
         
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS devices (
@@ -354,7 +396,7 @@ def init_database():
                 created_date TEXT NOT NULL,
                 expiry_date TEXT NOT NULL,
                 is_active INTEGER DEFAULT 1,
-                max_devices INTEGER DEFAULT 2,
+                max_devices INTEGER DEFAULT 1,
                 current_devices INTEGER DEFAULT 0,
                 last_verified TEXT,
                 verify_count INTEGER DEFAULT 0,
@@ -362,6 +404,10 @@ def init_database():
                 created_by TEXT DEFAULT 'ADMIN'
             )
         ''')
+        try:
+            cursor.execute('UPDATE licenses SET max_devices = 1 WHERE max_devices IS NULL OR max_devices > 1')
+        except Exception:
+            pass
         
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS devices (
@@ -436,11 +482,11 @@ def add_license(customer_name: str, package: str, telegram_id: str = None, notes
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO licenses (license_key, customer_name, customer_telegram, package, 
-                                  created_date, expiry_date, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                                  created_date, expiry_date, notes, max_devices, current_devices)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (license_key, customer_name.upper(), telegram_id, package,
               created.strftime("%Y-%m-%d %H:%M:%S"), 
-              expiry.strftime("%Y-%m-%d %H:%M:%S"), notes))
+              expiry.strftime("%Y-%m-%d %H:%M:%S"), notes, 1, 0))
         conn.commit()
         conn.close()
         return True, license_key, expiry.strftime('%Y-%m-%d')
@@ -458,6 +504,10 @@ def get_license_info(license_key: str) -> Optional[Dict]:
         conn.close()
         
         if row:
+            if isinstance(row, dict):
+                return dict(row)
+            if hasattr(row, "keys"):
+                return {k: row[k] for k in row.keys()}
             return dict(row)
         return None
     except Exception as e:
@@ -481,8 +531,8 @@ def verify_license_key(license_key: str, device_id: str = None, ip_address: str 
             conn.close()
             return "INVALID", "License key not found in database.", {}
         
-        license_data = dict(row)
-        expiry = datetime.strptime(license_data['expiry_date'], "%Y-%m-%d %H:%M:%S")
+        license_data = {k: row[k] for k in row.keys()} if hasattr(row, "keys") else dict(row)
+        expiry = datetime.strptime(str(license_data['expiry_date']), "%Y-%m-%d %H:%M:%S")
         days_left = (expiry - datetime.now()).days
         
         # Check if deactivated
@@ -491,7 +541,7 @@ def verify_license_key(license_key: str, device_id: str = None, ip_address: str 
             conn.close()
             return "INVALID", "License has been DEACTIVATED by admin.\nContact support for help.", {}
         
-        # Check if expired
+        # Check if expired (active only until expiry_date)
         if datetime.now() > expiry:
             log_verification(license_key, device_id, ip_address, "EXPIRED")
             conn.close()
@@ -500,6 +550,36 @@ def verify_license_key(license_key: str, device_id: str = None, ip_address: str 
                 "package": license_data['package'],
                 "expired_on": expiry.strftime('%Y-%m-%d')
             }
+
+        # Device lock: 1 key = max_devices PCs (default 1 — no multi-device share)
+        max_dev = int(license_data.get('max_devices') or 1)
+        if device_id:
+            did = str(device_id).strip()
+            cursor.execute(
+                'SELECT device_id FROM devices WHERE license_key = ? AND device_id = ?',
+                (license_key, did)
+            )
+            known = cursor.fetchone()
+            if not known:
+                cursor.execute(
+                    'SELECT COUNT(*) AS c FROM devices WHERE license_key = ?',
+                    (license_key,)
+                )
+                cnt_row = cursor.fetchone()
+                used = int(cnt_row[0] if cnt_row is not None else 0)
+                if used >= max_dev:
+                    log_verification(license_key, device_id, ip_address, "DEVICE_LIMIT")
+                    conn.close()
+                    return "INVALID", (
+                        f"Device limit reached ({max_dev}).\n"
+                        "This license is already bound to another PC.\n"
+                        "Contact admin to reset devices."
+                    ), {
+                        "customer": license_data['customer_name'],
+                        "package": license_data['package'],
+                        "max_devices": max_dev,
+                        "devices_used": used,
+                    }
         
         # Update verification stats
         cursor.execute('''
@@ -513,9 +593,20 @@ def verify_license_key(license_key: str, device_id: str = None, ip_address: str 
         # Log verification
         log_verification(license_key, device_id, ip_address, "VALID")
         
-        # Track device if provided
+        # Bind / refresh this device
         if device_id:
-            track_device(license_key, device_id, ip_address)
+            track_device(license_key, str(device_id).strip(), ip_address)
+            cursor.execute(
+                'SELECT COUNT(*) AS c FROM devices WHERE license_key = ?',
+                (license_key,)
+            )
+            cnt_row = cursor.fetchone()
+            used_now = int(cnt_row[0] if cnt_row is not None else 0)
+            cursor.execute(
+                'UPDATE licenses SET current_devices = ? WHERE license_key = ?',
+                (used_now, license_key)
+            )
+            conn.commit()
         
         conn.close()
         
@@ -524,7 +615,8 @@ def verify_license_key(license_key: str, device_id: str = None, ip_address: str 
             "package": license_data['package'],
             "days_left": days_left,
             "expiry_date": expiry.strftime('%Y-%m-%d'),
-            "verify_count": license_data['verify_count'] + 1
+            "verify_count": license_data['verify_count'] + 1,
+            "max_devices": max_dev,
         }
         
     except Exception as e:
@@ -712,6 +804,19 @@ def add_note(license_key: str, note: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, str(e)
 
+def _count0(row) -> int:
+    """Safe COUNT(*) from HybridRow / tuple / dict."""
+    if row is None:
+        return 0
+    try:
+        return int(row[0])
+    except Exception:
+        try:
+            return int(row.get("count") or row.get("c") or 0)
+        except Exception:
+            return 0
+
+
 def get_statistics() -> Dict:
     """Get license statistics"""
     try:
@@ -720,22 +825,22 @@ def get_statistics() -> Dict:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         cursor.execute('SELECT COUNT(*) FROM licenses')
-        total = cursor.fetchone()[0]
+        total = _count0(cursor.fetchone())
         
         cursor.execute('SELECT COUNT(*) FROM licenses WHERE is_active = 1 AND expiry_date > ?', (now,))
-        active = cursor.fetchone()[0]
+        active = _count0(cursor.fetchone())
         
         cursor.execute('SELECT COUNT(*) FROM licenses WHERE expiry_date < ?', (now,))
-        expired = cursor.fetchone()[0]
+        expired = _count0(cursor.fetchone())
         
         cursor.execute('SELECT COUNT(*) FROM licenses WHERE is_active = 0')
-        deactivated = cursor.fetchone()[0]
+        deactivated = _count0(cursor.fetchone())
         
         cursor.execute('SELECT COUNT(*) FROM devices')
-        devices = cursor.fetchone()[0]
+        devices = _count0(cursor.fetchone())
         
         cursor.execute('SELECT COUNT(*) FROM verify_logs WHERE DATE(verify_time) = DATE("now")')
-        today_verifications = cursor.fetchone()[0]
+        today_verifications = _count0(cursor.fetchone())
         
         # Package breakdown
         cursor.execute('''
@@ -1022,7 +1127,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("💰 License Prices / দাম", callback_data="cust_prices")],
             [InlineKeyboardButton("🛒 Buy License / কিনুন", callback_data="cust_buy")],
             [InlineKeyboardButton("🔑 Check License / চেক করুন", callback_data="cust_verify")],
-            [InlineKeyboardButton("� Help & Support / সাহায্য", callback_data="cust_help")]
+            [InlineKeyboardButton("❓ Help & Support / সাহায্য", callback_data="cust_help")]
         ]
         await update.message.reply_text(msg, parse_mode='HTML', 
                                         reply_markup=InlineKeyboardMarkup(keyboard))
@@ -1169,23 +1274,41 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = """
 ➕ <b>Create New License</b>
 
-Use command:
+1️⃣ Package বাটনে চাপুন
+2️⃣ তারপর কাস্টমার নাম লিখে পাঠান
+
+অথবা কমান্ড:
 <code>/add CustomerName Package</code>
-
-<b>Packages:</b>
-• TRIAL - 7 days (Free)
-• BASIC - 30 days ($100)
-• PRO - 90 days ($250)
-• VIP - 1 year ($1000)
-• LIFETIME - Forever ($2500)
-
-<b>Examples:</b>
-<code>/add RAKIB PRO</code>
-<code>/add KARIM VIP</code>
+Example: <code>/add Mira LIFETIME</code>
 """
-        keyboard = [[InlineKeyboardButton("🔙 Back", callback_data="admin_back")]]
-        await query.edit_message_text(msg, parse_mode='HTML', 
+        keyboard = [
+            [
+                InlineKeyboardButton("TRIAL", callback_data="admin_pkg_TRIAL"),
+                InlineKeyboardButton("BASIC", callback_data="admin_pkg_BASIC"),
+                InlineKeyboardButton("PRO", callback_data="admin_pkg_PRO"),
+            ],
+            [
+                InlineKeyboardButton("VIP", callback_data="admin_pkg_VIP"),
+                InlineKeyboardButton("LIFETIME", callback_data="admin_pkg_LIFETIME"),
+            ],
+            [InlineKeyboardButton("🔙 Back", callback_data="admin_back")],
+        ]
+        await query.edit_message_text(msg, parse_mode='HTML',
                                      reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif data.startswith("admin_pkg_"):
+        package = data.replace("admin_pkg_", "").upper()
+        context.user_data["pending_license_package"] = package
+        await query.edit_message_text(
+            f"📦 Package: <b>{package}</b>\n\n"
+            f"এখন কাস্টমারের নাম লিখে পাঠান (এক শব্দ):\n"
+            f"Example: <code>Mira</code>",
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔙 Cancel", callback_data="admin_create")]]
+            ),
+        )
+        return
     
     # ═══════════════ LIST LICENSES ═══════════════
     elif data.startswith("admin_list_"):
@@ -1603,49 +1726,57 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def add_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Create new license"""
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔ Admin only command.")
-        return
-    
-    if len(context.args) < 2:
-        msg = """
-<b>Usage:</b> /add <code>name package</code>
+    """Create new license — always replies (never silent)."""
+    try:
+        if not update.message:
+            return
+        if not is_admin(update.effective_user.id):
+            await update.message.reply_text("⛔ Admin only command.")
+            return
 
-<b>Packages:</b> TRIAL, BASIC, PRO, VIP, LIFETIME
+        if len(context.args) < 2:
+            msg = (
+                "<b>Usage:</b> /add <code>name package</code>\n\n"
+                "<b>Packages:</b> TRIAL, BASIC, PRO, VIP, LIFETIME\n\n"
+                "<b>Examples:</b>\n"
+                "<code>/add RAKIB PRO</code>\n"
+                "<code>/add KARIM BASIC</code>\n"
+                "<code>/add Mira LIFETIME</code>"
+            )
+            await update.message.reply_text(msg, parse_mode='HTML')
+            return
 
-<b>Examples:</b>
-<code>/add RAKIB PRO</code>
-<code>/add KARIM BASIC</code>
-"""
+        name = context.args[0]
+        package = context.args[1].upper()
+
+        await update.message.reply_text(f"⏳ Creating license for <b>{name}</b> ({package})...", parse_mode='HTML')
+
+        success, key, expiry = add_license(name, package)
+
+        if success:
+            pkg_info = LICENSE_PACKAGES.get(package, {})
+            msg = (
+                f"✅ <b>LICENSE CREATED!</b>\n\n"
+                f"👤 <b>Customer:</b> {name.upper()}\n"
+                f"📦 <b>Package:</b> {package}\n"
+                f"💰 <b>Price:</b> {pkg_info.get('price', 'N/A')}\n"
+                f"📅 <b>Duration:</b> {pkg_info.get('duration_days', 'N/A')} days\n"
+                f"⏰ <b>Expires:</b> {expiry}\n"
+                f"📱 <b>Max devices:</b> 1\n\n"
+                f"🔑 <b>License Key:</b>\n"
+                f"<code>{key}</code>\n\n"
+                f"📋 Copy করে Customer কে দিন!"
+            )
+        else:
+            msg = f"❌ Failed to create license:\n<code>{expiry}</code>"
+
         await update.message.reply_text(msg, parse_mode='HTML')
-        return
-    
-    name = context.args[0]
-    package = context.args[1].upper()
-    
-    success, key, expiry = add_license(name, package)
-    
-    if success:
-        pkg_info = LICENSE_PACKAGES.get(package, {})
-        msg = f"""
-✅ <b>LICENSE CREATED!</b>
-
-👤 <b>Customer:</b> {name.upper()}
-📦 <b>Package:</b> {package}
-💰 <b>Price:</b> {pkg_info.get('price', 'N/A')}
-📅 <b>Duration:</b> {pkg_info.get('duration_days', 'N/A')} days
-⏰ <b>Expires:</b> {expiry}
-
-🔑 <b>License Key:</b>
-<code>{key}</code>
-
-📋 Copy করে Customer কে দিন!
-"""
-    else:
-        msg = f"❌ Failed: {expiry}"
-    
-    await update.message.reply_text(msg, parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"add_command error: {e}")
+        try:
+            await update.message.reply_text(f"❌ Error: {e}")
+        except Exception:
+            pass
 
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Get full license info"""
@@ -2019,6 +2150,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle text messages - verify license keys or forward support messages"""
     text = update.message.text.strip()
     user = update.effective_user
+
+    # ═══════════════ ADMIN CREATE LICENSE (name after package button) ═══════════════
+    if is_admin(user.id) and context.user_data.get("pending_license_package"):
+        package = context.user_data.pop("pending_license_package", None)
+        name = text.split()[0] if text else ""
+        if not name or not package:
+            await update.message.reply_text("❌ Name missing. Use /add Name Package")
+            return
+        await update.message.reply_text(f"⏳ Creating <b>{name}</b> / {package}...", parse_mode="HTML")
+        success, key, expiry = add_license(name, package)
+        if success:
+            await update.message.reply_text(
+                f"✅ <b>LICENSE CREATED!</b>\n\n"
+                f"👤 {name.upper()} | 📦 {package}\n"
+                f"⏰ Expires: {expiry} | 📱 Max devices: 1\n\n"
+                f"🔑 <code>{key}</code>",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(f"❌ Failed: {expiry}")
+        return
     
     # ═══════════════ ADMIN REPLY MODE ═══════════════
     # Check if admin is replying to a customer
@@ -2492,6 +2644,34 @@ def api_stats():
     
     return jsonify(get_statistics())
 
+
+@flask_app.route("/api/create")
+def api_create():
+    """Admin-only: create license via HTTP (backup when Telegram /add is silent).
+    Query: secret=ADMIN_ID&name=Mira&package=LIFETIME
+    """
+    secret = request.args.get('secret', '')
+    if secret != str(ADMIN_ID):
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    name = (request.args.get('name') or '').strip()
+    package = (request.args.get('package') or '').strip().upper()
+    if not name or not package:
+        return jsonify({"ok": False, "error": "Missing name or package"}), 400
+    health = check_db_health()
+    if not health.get("ok"):
+        return jsonify({"ok": False, "error": health.get("message", "DB down")}), 503
+    success, key, expiry = add_license(name, package)
+    if not success:
+        return jsonify({"ok": False, "error": expiry, "key": ""}), 500
+    return jsonify({
+        "ok": True,
+        "key": key,
+        "customer": name.upper(),
+        "package": package,
+        "expires": expiry,
+        "max_devices": 1,
+    })
+
 def run_flask():
     """Run Flask server"""
     port = int(os.environ.get('PORT', 10000))
@@ -2628,13 +2808,16 @@ def main():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
         
+        # drop_pending_updates=False so /start after wake is not silently discarded
         # stop_signals=None = required on some hosts so polling isn't killed
-        app.run_polling(drop_pending_updates=True, stop_signals=None)
+        print("📡 Starting Telegram polling (only ONE Render service must use this TOKEN)")
+        app.run_polling(drop_pending_updates=False, stop_signals=None)
         
     except Exception as e:
         logger.error(f"❌ Bot crashed: {e}")
         import traceback
         traceback.print_exc()
+        # Keep process alive so /api/health still reports (Render free sleep/wake)
         while True:
             threading.Event().wait(60)
 
